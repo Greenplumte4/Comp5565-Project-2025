@@ -17,17 +17,17 @@ contract WarrantyManager is IWarrantyManager, Ownable {
 
     // ClaimStatus：定义保修索赔的当前状态。
     enum ClaimStatus {
-        None,           // 0
-        Active,         // 1
-        Pending,        // 2
-        Expired,        // 3
-        Fulfilled       // 4
+        None,           // 0 还未发行
+        Active,         // 1 仍在保修期
+        Pending,        // 2 客户已申请，等待服务中心审批
+        Expired,        // 3 超过了durationDays的限制，已过期
+        Fulfilled       // 4 超过了maxClaims的限制，保修次数已用完
     }
 
     // Warranty：存储单个产品 ID 对应的保修数据。
     struct Warranty {
         uint256 startDate;      // 保修开始的时间戳。
-        uint256 durationDays;   // 修复 Test 1: 保修的总持续时间（天）。
+        uint256 durationDays;   // 保修的总持续时间（天）。
         uint8 maxClaims;        // 保修期内允许的最大索赔次数。
         uint8 claimedCount;     // 已使用的索赔次数。
         ClaimStatus status;     // 当前的索赔状态。

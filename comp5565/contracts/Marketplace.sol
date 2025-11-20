@@ -3,10 +3,10 @@
 pragma solidity ^0.8.20;
 
 import "./I_Interfaces.sol";
-import "@openzeppelin/contracts/access/Ownable.sol"; // 新增: 引入 Ownable 权限管理
+import "@openzeppelin/contracts/access/Ownable.sol"; 
 
 // Marketplace 合约：作为协调中心，负责产品在供应链中的分发、销售和转售流程。
-contract Marketplace is Ownable { // 继承 Ownable
+contract Marketplace is Ownable { 
     
     // accessControl：角色管理合约，用于验证交易发起人是否具备制造商、零售商等身份。
     IRolesContract public accessControl;
@@ -33,7 +33,7 @@ contract Marketplace is Ownable { // 继承 Ownable
     }
 
     // setProductRegistryAddress：设置 ProductRegistry 合约的地址。
-    function setProductRegistryAddress(address _registryAddr) public onlyOwner { // 权限增强: 仅限 Owner 调用
+    function setProductRegistryAddress(address _registryAddr) public onlyOwner { 
         // 确保 ProductRegistry 尚未设置，防止重复初始化或被恶意覆盖。
         require(address(productRegistry) == address(0), "MP: Registry already set.");
         require(_registryAddr != address(0), "MP: Invalid address.");
@@ -42,23 +42,25 @@ contract Marketplace is Ownable { // 继承 Ownable
 
     // registerAndDistribute：制造商首次将新产品引入区块链并分发给零售商的流程。
     function registerAndDistribute(
-        address retailerAddress,        // 目标零售商的地址。
-        string memory serialNumber,    // 产品的全球唯一物理序列号。
-        string memory modelDetails,    // 产品的型号和配置描述。
-        string memory manufacturerDetails, // 制造商或批次细节。
-        uint256 price,                 // 产品的建议零售价或出厂价。
-        string memory warrantyTermsURI, // 指向保修条款元数据的 URI (IPFS/HTTP)。
-        uint256 durationDays,          // 保修的持续时间（天数）。
-        uint8 maxClaims                // 保修期内允许的最大索赔次数。
+        address retailerAddress,
+        string memory serialNumber,
+        string memory modelDetails,
+        string memory manufacturerDetails,
+        uint256 price,
+        string memory warrantyTermsURI,
+        uint256 durationDays,
+        uint8 maxClaims // <-- 这里不能有逗号
     ) external {
         // 权限检查：确保调用者是制造商，且目标是授权零售商。
         require(accessControl.isManufacturer(msg.sender), "MP: Only Manufacturer can register.");
         require(accessControl.isRetailer(retailerAddress), "MP: Target is not a Retailer.");
         require(address(productRegistry) != address(0), "MP: Registry not set."); 
 
-        // 1. 铸造 NFT：在 ProductRegistry 中创建产品身份，所有权直接给零售商。
+        // -------------------------------------------------------------
+        // 1. 铸造 NFT：【修正】所有权首先给制造商 (msg.sender)。
+        // -------------------------------------------------------------
         uint256 tokenId = productRegistry.mintProduct(
-            retailerAddress, 
+            msg.sender, // <--- 关键修正：铸造给制造商 (msg.sender)
             serialNumber,
             modelDetails,
             manufacturerDetails,
@@ -69,7 +71,16 @@ contract Marketplace is Ownable { // 继承 Ownable
         // 2. 初始保修：调用 WarrantyManager 启动产品的保修期。
         warrantyManager.issueWarranty(tokenId, durationDays, maxClaims);
 
-        // 3. 记录事件：记录制造商 -> 零售商的初始分发历史。
+        // -------------------------------------------------------------
+        // 3. 转移：从制造商 (msg.sender) 转移给零售商 (retailerAddress)。
+        // -------------------------------------------------------------
+        IProductRegistry(address(productRegistry)).transferFrom(
+            msg.sender, // 制造商
+            retailerAddress, // 零售商
+            tokenId
+        );
+
+        // 4. 记录事件：记录制造商 -> 零售商的初始分发历史。
         productRegistry.recordOwnershipTransfer(tokenId, msg.sender, retailerAddress, "INITIAL_DISTRIBUTION");
     }
 
@@ -103,6 +114,7 @@ contract Marketplace is Ownable { // 继承 Ownable
         productRegistry.updateMarketInfo(productId, 0, false);
         
         // 2. 所有权转移：零售商 -> 客户，使用标准 transferFrom (Retailer is a role).
+        // 注意：这里的调用者是 Marketplace 合约，它在 ProductRegistry 中应具有操作权限。
         IProductRegistry(address(productRegistry)).transferFrom(currentOwner, customerAddress, productId);
         
         // 3. 记录事件：记录零售销售历史。
@@ -111,10 +123,10 @@ contract Marketplace is Ownable { // 继承 Ownable
 
     // customerResale：最终客户通过 Marketplace 将产品转售给其他客户的流程。
     function customerResale(
-        uint256 productId,             // 要转售的产品 NFT ID。
-        address newCustomerAddress,    // 新买家的地址。
-        uint256 newPrice,              // 转售的市场价格。
-        bool isListed                  // 转售完成后是否保留在市场上架状态。
+        uint256 productId, 
+        address newCustomerAddress, 
+        uint256 newPrice, 
+        bool isListed // <--- 确保这里没有逗号
     ) external {
         require(address(productRegistry) != address(0), "MP: Registry not set."); 
 
@@ -126,7 +138,7 @@ contract Marketplace is Ownable { // 继承 Ownable
         productRegistry.updateMarketInfo(productId, newPrice, isListed);
 
         // 2. 所有权转移：客户 -> 新客户，使用 restrictedTransferFrom (此转账需 Marketplace 授权)。
-        // restrictedTransferFrom 在 ProductRegistry 中不再检查保修状态，允许在保修期内转售。
+        // Marketplace 调用 restrictedTransferFrom，ProductRegistry 检查 Marketplace 是否被授权。
         IProductRegistry(address(productRegistry)).restrictedTransferFrom(
             currentOwner, 
             newCustomerAddress, 
