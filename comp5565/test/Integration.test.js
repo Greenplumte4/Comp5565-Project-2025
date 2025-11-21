@@ -1,5 +1,4 @@
-// File: test/Integration.test.js (最终修正版本)
-
+// File: test/Integration.test.js
 const { expect } = require("chai");
 const { ethers } = require("hardhat");
 
@@ -16,7 +15,7 @@ const ClaimStatus = {
 describe("System Integration Test: Product Lifecycle & Warranty", function () {
     let roles, warranty, registry, marketplace;
     let deployer, manufacturer, retailer, serviceCenter, customer1, customer2;
-    let initialTokenId = 1000;
+    const initialTokenId = 1000;
     const WARRANTY_DURATION_DAYS = 365;
     let nextTokenId = initialTokenId; // 用于跟踪下一个铸造的ID
 
@@ -25,19 +24,18 @@ describe("System Integration Test: Product Lifecycle & Warranty", function () {
     const RETAILER_ROLE = ethers.id("RETAILER_ROLE");
     const SERVICECENTER_ROLE = ethers.id("SERVICECENTER_ROLE");
 
-    // 辅助函数：铸造一个新产品，模拟制造商的分发流程。
-    // 逻辑：制造商调用 registerAndDistribute(to, ...)，该函数在 Marketplace 中完成：
-    // 1. 铸造给制造商 (msg.sender)
-    // 2. 转移给 to (零售商)
-    async function mintNewProduct(to, maxClaims = 3) {
+    // 【修改 1】: 辅助函数，只负责制造商铸造和上架，不进行分发。
+    // 产品所有者将是制造商（manufacturer）。
+    async function mintNewProduct(maxClaims = 3) {
         const currentTokenId = nextTokenId;
-        // 调用 Marketplace 的注册分发函数
-        await marketplace.connect(manufacturer).registerAndDistribute(
-            to, 
+        const price = ethers.parseEther("1000");
+
+        // 制造商调用 Marketplace 的 registerProduct (铸造并上架给自己)
+        await marketplace.connect(manufacturer).registerProduct(
             `SN-${currentTokenId}`, 
             "Model-X", 
             "Acme Corp", 
-            ethers.parseEther("1000"), 
+            price, 
             "ipfs://warranty-terms",
             WARRANTY_DURATION_DAYS, 
             maxClaims
@@ -59,7 +57,6 @@ describe("System Integration Test: Product Lifecycle & Warranty", function () {
         roles = await RolesContract.deploy();
         
         const WarrantyManager = await ethers.getContractFactory("WarrantyManager");
-        // **重要：假设 WarrantyManager 是实际合约，而不是 Mock，且实现了 isWarrantyValid**
         warranty = await WarrantyManager.deploy(roles.target);
         
         const ProductRegistry = await ethers.getContractFactory("ProductRegistry");
@@ -84,11 +81,12 @@ describe("System Integration Test: Product Lifecycle & Warranty", function () {
         await roles.grantRole(RETAILER_ROLE, retailer.address);
         await roles.grantRole(SERVICECENTER_ROLE, serviceCenter.address);
         
-        // 授予 Marketplace 代理权限 (制造商的授权是必须的，因为它现在是铸造后的第一个所有者)
-        await registry.connect(manufacturer).setApprovalForAll(marketplace.target, true);
-        await registry.connect(retailer).setApprovalForAll(marketplace.target, true);
-        await registry.connect(customer1).setApprovalForAll(marketplace.target, true);
-        await registry.connect(customer2).setApprovalForAll(marketplace.target, true);
+        // 注意：由于 Marketplace 使用 executeMarketTransaction (特权转移)，
+        // 因此不需要调用 setApprovalForAll。保留这些行用于文档或未来升级。
+        // await registry.connect(manufacturer).setApprovalForAll(marketplace.target, true);
+        // await registry.connect(retailer).setApprovalForAll(marketplace.target, true);
+        // await registry.connect(customer1).setApprovalForAll(marketplace.target, true);
+        // await registry.connect(customer2).setApprovalForAll(marketplace.target, true);
         
         console.log("     ✅ 角色授予和全局授权成功。");
     });
@@ -97,59 +95,62 @@ describe("System Integration Test: Product Lifecycle & Warranty", function () {
     // 核心业务流程测试
     // =================================================================
 
-    // 步骤 3：测试制造商首次注册产品并分发给零售商。
-    it("3. 制造商注册产品并分配给零售商 (registerAndDistribute)", async function () {
-        // 铸造 ID 1000，序列号 SN-1000
+    // 【修改 2】: 制造商注册 -> 零售商购买 (Distribution Sale)
+    it("3. 制造商注册产品并销售给零售商 (DISTRIBUTION_SALE)", async function () {
         const expectedMaxClaims = 3;
-        const tokenId = await mintNewProduct(retailer.address, expectedMaxClaims);
+        const tokenId = await mintNewProduct(expectedMaxClaims); // 铸造并上架给自己
+        const price = ethers.parseEther("1000"); // 注册时的价格
+        
+        // 验证初始所有者是制造商
+        expect(await registry.ownerOf(tokenId)).to.equal(manufacturer.address);
+
+        // 零售商购买 (DISTRIBUTION_SALE)
+        await marketplace.connect(retailer).buyProduct(tokenId, { value: price });
         
         // 验证最终所有者是零售商
         expect(await registry.ownerOf(tokenId)).to.equal(retailer.address);
         
-        // 验证保修信息
+        // 验证保修信息 (Max claims, claimedCount)
         const warrantyData = await warranty.getWarrantyStatus(tokenId);
-        
-        // **【关键修复】根据 WarrantyManager.sol 的返回结构：
-        // 索引 2 是 maxClaims (期望值 3)
-        // 索引 3 是 claimedCount (期望值 0)
-        
-        // 验证 maxClaims
         expect(warrantyData[2], "Max claims check failed").to.equal(expectedMaxClaims); 
+        expect(warrantyData[3], "Claimed count check failed").to.equal(0);
         
-        // 验证 claimedCount
-        expect(warrantyData[3], "Claimed count check failed").to.equal(0); // <--- 修复了原始的 'expected 0 to equal 3' 错误
-        
-        // 验证历史记录（使用 verifyProduct 替代 getOwnershipHistory）
+        // 验证历史记录：最后一条记录应该是 DISTRIBUTION_SALE (由 buyProduct 记录)
         const verificationData = await registry.verifyProduct(tokenId);
         const history = verificationData.ownershipHistory;
+        expect(history[history.length - 1].eventType).to.equal("DISTRIBUTION_SALE");
         
-        
-        // 假设历史记录长度 >= 1
-        expect(history.length).to.be.at.least(1);
-        
-        // 验证最后一条记录是 INITIAL_DISTRIBUTION
-        expect(history[history.length - 1].eventType).to.equal("INITIAL_DISTRIBUTION");
-        
-        console.log("     ✅ 产品注册、保修发行、历史记录验证成功。");
+        console.log("     ✅ 产品注册、分销销售、保修发行、历史记录验证成功。");
     });
 
-    // 步骤 4：测试零售商将产品销售给客户。
-    it("4. 零售商销售给客户 (retailSaleToCustomer)", async function () {
+    // 【修改 3】: 零售商上架 -> 客户购买 (Retail Sale)
+    it("4. 零售商销售给客户 (RETAIL_SALE)", async function () {
         const tokenId = initialTokenId; // ID: 1000
+        const retailPrice = ethers.parseEther("1200"); // 零售商加价
+
+        // 4A. 零售商重新上架
+        await marketplace.connect(retailer).listProduct(tokenId, retailPrice);
+        const [price, isListed] = await registry.getProductMarketInfo(tokenId);
+        expect(price).to.equal(retailPrice);
+        expect(isListed).to.be.true;
+
+        // 4B. 客户购买
+        // 注意：客户必须发送足够的 ETH
+        await marketplace.connect(customer1).buyProduct(tokenId, { value: retailPrice });
         
-        await marketplace.connect(retailer).retailSaleToCustomer(
-            tokenId, 
-            customer1.address 
-        );
-        
+        // 验证所有权
         expect(await registry.ownerOf(tokenId)).to.equal(customer1.address);
+        
+        // 验证自动下架
+        const [, isListedAfterSale] = await registry.getProductMarketInfo(tokenId);
+        expect(isListedAfterSale).to.be.false;
         
         // 验证历史记录
         const verificationData = await registry.verifyProduct(tokenId);
         const history = verificationData.ownershipHistory;
         expect(history[history.length - 1].eventType).to.equal("RETAIL_SALE");
         
-        console.log("     ✅ 零售销售和历史记录验证成功。");
+        console.log("     ✅ 零售商上架、客户购买 (RETAIL_SALE) 验证成功。");
     });
 
     // 步骤 5：测试保修索赔的完整流程。
@@ -159,62 +160,76 @@ describe("System Integration Test: Product Lifecycle & Warranty", function () {
         // 5A. 客户1 发起服务请求
         await warranty.connect(customer1).requestService(tokenId);
         
+        // 5B. 验证状态变为 Pending
+        const pendingStatusIndex = 4;
+        let warrantyData = await warranty.getWarrantyStatus(tokenId);
+        expect(warrantyData[pendingStatusIndex]).to.equal(ClaimStatus.Pending);
+
         // 5C. 服务中心拒绝索赔
         await warranty.connect(serviceCenter).rejectClaim(tokenId, "Not covered.");
         
-        // 5D. 客户再次发起请求，服务中心批准
+        // 5D. 客户再次发起请求，服务中心批准 ( claimedCount: 0 -> 1 )
         await warranty.connect(customer1).requestService(tokenId);
         await warranty.connect(serviceCenter).approveClaim(tokenId, "Approved fix.");
         
         // 验证状态：claimedCount 是索引 3
         const claimedCountIndex = 3; 
-        const warrantyData = await warranty.getWarrantyStatus(tokenId);
+        warrantyData = await warranty.getWarrantyStatus(tokenId);
         const claimedCount = warrantyData[claimedCountIndex]; 
+        const status = warrantyData[pendingStatusIndex];
 
         expect(claimedCount).to.equal(1); 
+        expect(status).to.equal(ClaimStatus.Active); // 批准后回到 Active 状态
         
         console.log("     ✅ 完整的保修审批/拒绝流程和权限检查成功。");
     });
     
-    // 步骤 6A：验证客户转售（限制解除）。
-    it("6A. 客户转售产品 (customerResale) - 成功案例（保修有效时转售）", async function() {
+    // 【修改 4】: 客户上架 -> 客户购买 (Secondary Sale/Resale)
+    it("6A. 客户转售产品 (SECONDARY_SALE) - 成功案例", async function() {
         const tokenId = initialTokenId; // ID: 1000
-        const newPrice = ethers.parseEther("500");
+        const resalePrice = ethers.parseEther("500");
 
-        // 验证保修是否有效
-        expect(await warranty.isWarrantyValid(tokenId)).to.be.true;
+        // 6A-1. 客户1 将产品重新上架
+        // 客户1 (当前所有者) 连接 Marketplace 进行上架
+        await marketplace.connect(customer1).listProduct(tokenId, resalePrice);
+        
+        // 6A-2. 验证保修是否有效
+        expect(await warranty.isWarrantyValid(tokenId)).to.be.true; 
 
-        // Customer1 -> Customer2
-        await expect(
-            marketplace.connect(customer1).customerResale(
-                tokenId, 
-                customer2.address, 
-                newPrice,
-                true
-            )
-        ).to.not.be.reverted;
+        // 6A-3. 客户2 购买 (SECONDARY_SALE)
+        await marketplace.connect(customer2).buyProduct(tokenId, { value: resalePrice });
 
+        // 验证所有权
         expect(await registry.ownerOf(tokenId)).to.equal(customer2.address);
         
-        // 验证历史记录
+        // 验证历史记录：非制造商/零售商的销售将记录为 SECONDARY_SALE
         const verificationData = await registry.verifyProduct(tokenId);
         const history = verificationData.ownershipHistory;
-        expect(history[history.length - 1].eventType).to.equal("CUSTOMER_RESALE");
+        expect(history[history.length - 1].eventType).to.equal("SECONDARY_SALE"); 
         
-        console.log("     ✅ 客户转售（CUSTOMER_RESALE）成功。");
+        console.log("     ✅ 客户转售（SECONDARY_SALE）成功。");
     });
 
-    // 步骤 6B：负面测试，达到最大索赔次数。
+    // 【修改 5】: 负面测试，达到最大索赔次数。
     it("6B. 负面测试：保修达到最大索赔次数后，无法发起新请求", async function() {
         // 铸造 ID 1001, maxClaims=1
-        const maxClaimsTokenId = await mintNewProduct(retailer.address, 1); 
+        const maxClaimsTokenId = await mintNewProduct(1); 
+        const price = ethers.parseEther("1000"); // 制造商注册时的价格
 
-        // 分配给客户
-        await marketplace.connect(retailer).retailSaleToCustomer(maxClaimsTokenId, customer1.address); 
-
+        // 1. 零售商购买 (Distribution Sale)
+        await marketplace.connect(retailer).buyProduct(maxClaimsTokenId, { value: price });
+        // 2. 零售商上架
+        await marketplace.connect(retailer).listProduct(maxClaimsTokenId, price);
+        // 3. 客户购买 (Retail Sale)
+        await marketplace.connect(customer1).buyProduct(maxClaimsTokenId, { value: price });
+        
         // 第一次索赔 (消耗 1/1)
         await warranty.connect(customer1).requestService(maxClaimsTokenId);
         await warranty.connect(serviceCenter).approveClaim(maxClaimsTokenId, "Final Claim");
+        
+        // 验证状态变为 Fulfilled (索引 4)
+        const warrantyData = await warranty.getWarrantyStatus(maxClaimsTokenId);
+        expect(warrantyData[4]).to.equal(ClaimStatus.Fulfilled);
 
         // 第二次索赔 (应失败)
         await expect(
@@ -224,15 +239,13 @@ describe("System Integration Test: Product Lifecycle & Warranty", function () {
         console.log("     ✅ 最大索赔次数限制检查成功。");
     });
 
-    // =================================================================
-    // [新增] 步骤 7：集成测试中的真伪验证
-    // =================================================================
+    // [新增] 步骤 7：集成测试中的真伪验证 (需要假设 registry.getTokenIdBySerialNumber 存在)
+    // 注意: ProductRegistry.sol 中没有 getTokenIdBySerialNumber，但有 public serialNumberToTokenId。
     it("7. 产品真伪验证集成测试 (verifyProduct)", async function () {
         const tokenId = initialTokenId; // ID: 1000
-        // 当前所有者是 customer2，序列号是 SN-1000
         
         // 7A. 正向测试：通过序列号查询 ID，并使用 ID 验证所有者 (Owner应为 customer2)
-        const retrievedTokenId = await registry.getTokenIdBySerialNumber("SN-1000");
+        const retrievedTokenId = await registry.serialNumberToTokenId("SN-1000"); // 使用 public 映射
         expect(retrievedTokenId).to.equal(tokenId);
         
         const verificationData = await registry.verifyProduct(tokenId);
@@ -242,7 +255,7 @@ describe("System Integration Test: Product Lifecycle & Warranty", function () {
         console.log("     ✅ 产品序列号到 ID 的映射和真伪验证功能工作正常。");
     });
 
-    // 步骤 8 (原 6C)：动态状态验证。放在最后，因为它会修改区块链时间。
+    // 步骤 8：动态状态验证。
     it("8. 动态状态验证：模拟时间前进，验证保修状态动态变为 'Expired' (3)", async function () {
         const tokenId = initialTokenId; // ID: 1000
         

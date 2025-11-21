@@ -1,318 +1,236 @@
-// File: test/Unit_Marketplace.test.js (最终修正版本)
-
+// File: test/Unit_Marketplace.test.js
 const { expect } = require("chai");
 const { ethers } = require("hardhat");
 
-// Unit Test: Marketplace：专注于测试 Marketplace 合约的权限和核心业务逻辑。
-describe("Unit Test: Marketplace", function () {
-    let roles, registry, warrantyManagerMock, marketplace;
+describe("Unit Test: Marketplace (E-Commerce Model)", function () {
+    let roles, registry, warrantyManager, marketplace;
     let deployer, manufacturer, retailer, customer1, customer2, user;
 
-    const INITIAL_TOKEN_ID = 1000;
-    let nextTokenId = INITIAL_TOKEN_ID; // 跟踪下一个 ID
+    // 初始 ID 从 1000 开始 (对应 ProductRegistry 的 _nextTokenId)
+    let nextTokenId = 1000;
 
-    const TEST_SN = "SN-123";
-    const TEST_PRICE = ethers.parseEther("100"); // 100 ETH
+    const TEST_SN_PREFIX = "SN-";
+    const PRICE_MFG = ethers.parseEther("50");      // 制造商出厂价
+    const PRICE_RETAIL = ethers.parseEther("100");  // 零售商售价
+    const PRICE_RESALE = ethers.parseEther("80");   // 客户二手转售价
 
-    // 辅助函数：铸造产品到制造商名下（并分发给零售商，适配新合约逻辑）
-    // 注意：这里的函数名应反映合约的实际功能：注册并分发。
-    async function registerAndDistribute(retailerAddr, price = TEST_PRICE) {
-        const currentTokenId = nextTokenId;
-        // 调用 Marketplace.registerAndDistribute：铸造给制造商（msg.sender=manufacturer），然后转移给零售商
-        await marketplace.connect(manufacturer).registerAndDistribute(
-            retailerAddr, // 目标零售商地址
-            TEST_SN + "-" + currentTokenId, // 唯一序列号（避免重复）
-            "ModelX", 
-            "MFG Inc.", 
-            price, 
-            "URI", 
-            365, 
-            3
+    // 辅助函数：制造商注册新产品 (Mint & List)
+    async function registerProduct(price = PRICE_MFG) {
+        const currentId = nextTokenId;
+        const sn = TEST_SN_PREFIX + currentId;
+
+        await marketplace.connect(manufacturer).registerProduct(
+            sn,
+            "Model-X",
+            "MFG Inc.",
+            price,
+            "https://warranty.com/terms",
+            365, // 保修天数
+            3    // 最大索赔次数
         );
+        
         nextTokenId++;
-        return currentTokenId;
+        return currentId;
     }
 
-    // before：在所有测试开始前，部署所有合约并设置依赖关系。
     before(async function () {
         [deployer, manufacturer, retailer, customer1, customer2, user] = await ethers.getSigners();
+
+        // --- 1. 部署合约 ---
         
-        // --- 1. 部署和角色分配 ---
+        // A. Roles
         const RolesContract = await ethers.getContractFactory("RolesContract");
         roles = await RolesContract.deploy();
+        
+        // B. WarrantyManager (使用真实合约)
+        const WarrantyManager = await ethers.getContractFactory("WarrantyManager");
+        warrantyManager = await WarrantyManager.deploy(roles.target);
 
-        // 授予核心业务角色
+        // C. ProductRegistry
+        const ProductRegistry = await ethers.getContractFactory("ProductRegistry");
+        registry = await ProductRegistry.deploy(roles.target, warrantyManager.target);
+
+        // D. Marketplace
+        const Marketplace = await ethers.getContractFactory("Marketplace");
+        marketplace = await Marketplace.deploy(roles.target, warrantyManager.target);
+
+        // --- 2. 关键配置：连接所有合约地址 ---
+        await marketplace.setProductRegistryAddress(registry.target);
+        await warrantyManager.setProductRegistryAddress(registry.target);
+        await warrantyManager.setMarketplaceAddress(marketplace.target);
+        
+        // **最关键的一步：授权 Marketplace 操作 Registry**
+        await registry.setMarketplaceAddress(marketplace.target);
+
+        // --- 3. 授予角色 ---
         await roles.grantRole(ethers.id("MANUFACTURER_ROLE"), manufacturer.address);
         await roles.grantRole(ethers.id("RETAILER_ROLE"), retailer.address);
-
-        // 使用 MockWarrantyManager 模拟保修有效性
-        const MockWarrantyManager = await ethers.getContractFactory("MockWarrantyManager");
-        // **重要：确保 MockWarrantyManager 合约已在 contracts/ 目录中创建**
-        warrantyManagerMock = await MockWarrantyManager.deploy(true); // 默认设置为保修有效 (true)
-        
-        // 部署 Marketplace 和 ProductRegistry
-        const Marketplace = await ethers.getContractFactory("Marketplace");
-        marketplace = await Marketplace.deploy(roles.target, warrantyManagerMock.target);
-
-        const ProductRegistry = await ethers.getContractFactory("ProductRegistry");
-        registry = await ProductRegistry.deploy(roles.target, warrantyManagerMock.target);
-        
-        // 设置合约引用，解决循环依赖
-        await registry.setMarketplaceAddress(marketplace.target);
-        await marketplace.setProductRegistryAddress(registry.target);
-
-        // 授权：允许 Marketplace 代表角色转移 NFT (ProductRegistry的transferFrom检查需要这个授权)
-        // 注意：manufacturer 是铸造后的第一个所有者，它必须授权 marketplace 才能执行 transferFrom (distributeToRetailer 内部的转移)
-        await registry.connect(manufacturer).setApprovalForAll(marketplace.target, true);
-        await registry.connect(retailer).setApprovalForAll(marketplace.target, true);
-        await registry.connect(customer1).setApprovalForAll(marketplace.target, true);
-        await registry.connect(customer2).setApprovalForAll(marketplace.target, true);
+        // 如果需要测试保修流程，应添加 ServiceCenter 角色
     });
 
-    // 测试「铸造→制造商→零售商」核心链路
-    describe("Core Flow: Mint to Manufacturer → Distribute to Retailer", function () {
-        let tokenId;
+    // =============================================================
+    // 测试场景 1: 制造商注册 (Register)
+    // =============================================================
+    describe("1. Manufacturer Registration", function () {
+        it("制造商应能成功注册并上架产品", async function () {
+            const tokenId = await registerProduct(PRICE_MFG);
 
-        // 核心测试：制造商通过 Marketplace 注册产品并分发给零售商
-        it("应成功注册产品，所有权转移给零售商，并记录 INITIAL_DISTRIBUTION 事件", async function () {
-            // 铸造产品：产品ID在 registerAndDistribute 中确定
-            tokenId = await registerAndDistribute(retailer.address); 
-            
-            // 验证所有权转移给零售商
-            expect(await registry.ownerOf(tokenId)).to.equal(retailer.address);
+            // 验证：所有者应该是制造商
+            expect(await registry.ownerOf(tokenId)).to.equal(manufacturer.address);
 
-            // 验证流转事件（INITIAL_DISTRIBUTION）
-            const verificationData = await registry.verifyProduct(tokenId);
-            const transferEvents = verificationData.ownershipHistory;
-            
-            // 首次铸造事件 MINT_DISTRIBUTION (来自 ProductRegistry)
-            const mintEvent = transferEvents.find(event => event.eventType === "MINT_DISTRIBUTION");
-            expect(mintEvent).to.exist;
-            expect(mintEvent.to).to.equal(manufacturer.address); // 确认初始铸造给制造商
+            // 验证：市场信息 (价格正确，且已上架)
+            const marketInfo = await registry.getProductMarketInfo(tokenId);
+            expect(marketInfo.price).to.equal(PRICE_MFG);
+            expect(marketInfo.isListed).to.be.true;
 
-            // 分发事件 INITIAL_DISTRIBUTION (来自 Marketplace)
-            const distributeEvent = transferEvents.find(
-                event => event.eventType === "INITIAL_DISTRIBUTION"
-            );
-            expect(distributeEvent).to.exist;
-            expect(distributeEvent.from).to.equal(manufacturer.address);
-            expect(distributeEvent.to).to.equal(retailer.address);
-        });
+            // 验证：库存查询 (Manufacturer Inventory)
+            const inventory = await registry.getPlayerInventory(manufacturer.address);
+            // 修正：将 tokenId 转换为 BigInt 类型，以匹配 inventory 数组中的元素类型
+            expect(inventory).to.include(BigInt(tokenId)); 
+        }); // <--- 【修正点】: 闭合 it 块
 
-        // 非制造商调用 distributeToRetailer 检查
-        it("非制造商调用 registerAndDistribute 应失败", async function () {
+        it("非制造商不能注册", async function () {
             await expect(
-                marketplace.connect(retailer).registerAndDistribute(
-                    retailer.address, // to
-                    TEST_SN + "-FAIL-1", "ModelX", "MFG Inc.", TEST_PRICE, "URI", 365, 3
+                marketplace.connect(retailer).registerProduct(
+                    "SN-FAIL", "Model", "MFG", PRICE_MFG, "URI", 365, 3
                 )
             ).to.be.revertedWith("MP: Only Manufacturer can register.");
         });
-
-        // 制造商只能分发给授权零售商检查
-        it("制造商只能分发给授权零售商", async function () {
-            await expect(
-                marketplace.connect(manufacturer).registerAndDistribute(
-                    customer1.address, // target is customer
-                    TEST_SN + "-FAIL-2", "ModelX", "MFG Inc.", TEST_PRICE, "URI", 365, 3
-                )
-            ).to.be.revertedWith("MP: Target is not a Retailer.");
-        });
     });
 
-    // Retailer Sale to Customer (RetailSaleToCustomer) 测试
-    describe("Retailer Sale to Customer (RetailSaleToCustomer)", function () {
+    // =============================================================
+    // 测试场景 2: 零售商进货 (Buy from Manufacturer)
+    // =============================================================
+    describe("2. Retailer Buying (Distribution)", function () {
         let tokenId;
 
         beforeEach(async function () {
-            // 铸造→制造商→零售商（完成前置流程）
-            tokenId = await registerAndDistribute(retailer.address);
+            tokenId = await registerProduct(PRICE_MFG);
         });
 
-        it("非零售商调用 retailSaleToCustomer 应该失败", async function () {
+        it("零售商应能支付 ETH 并购买产品", async function () {
+            // 记录购买前的余额 (可选)
+            // const oldBal = await ethers.provider.getBalance(manufacturer.address);
+
+            // 零售商购买：必须发送 value
             await expect(
-                marketplace.connect(customer1).retailSaleToCustomer(tokenId, customer1.address)
-            ).to.be.revertedWith("MP: Only Retailer can sell.");
+                marketplace.connect(retailer).buyProduct(tokenId, { value: PRICE_MFG })
+            )
+            .to.emit(marketplace, "ProductSold")
+            .withArgs(tokenId, retailer.address, manufacturer.address, PRICE_MFG);
+
+            // 验证 1：所有权转移
+            expect(await registry.ownerOf(tokenId)).to.equal(retailer.address);
+
+            // 验证 2：自动下架 (买到后默认不在售)
+            const marketInfo = await registry.getProductMarketInfo(tokenId);
+            expect(marketInfo.isListed).to.be.false;
+
+            // 验证 3：历史记录类型
+            const verifyData = await registry.verifyProduct(tokenId);
+            const lastLog = verifyData.ownershipHistory[verifyData.ownershipHistory.length - 1];
+            expect(lastLog.eventType).to.equal("DISTRIBUTION_SALE");
         });
 
-        it("零售商不拥有产品时调用应该失败", async function () {
-            // 先将产品卖给客户1，零售商失去所有权
-            await marketplace.connect(retailer).retailSaleToCustomer(tokenId, customer1.address);
-
-            // 再次尝试销售，但这次卖给客户2
+        it("普通客户不能直接购买制造商的商品 (供应链限制)", async function () {
+            // 尝试用客户账号购买
             await expect(
-                marketplace.connect(retailer).retailSaleToCustomer(tokenId, customer2.address)
-            ).to.be.reverted; // 应该被 productRegistry.ownerOf 检查捕获
+                marketplace.connect(customer1).buyProduct(tokenId, { value: PRICE_MFG })
+            ).to.be.revertedWith("MP: Only Retailers can buy from Manufacturer.");
         });
 
-        // **修正：删除客户地址为角色账户时销售应失败的测试，因为 Marketplace.sol 没有这个检查**
-        // Marketplace.sol: require(accessControl.isRetailer(msg.sender), "MP: Only Retailer can sell.");
-        // transferFrom 允许角色账户之间的转移，且 retailSaleToCustomer 的目标地址是客户，没有限制不能是角色。
-        // 但为了严谨性，如果这是业务要求，应该在 Marketplace.sol 中添加检查。
-        // **如果您在 Marketplace.sol 中有以下代码：**
-        // require(!accessControl.hasAnyRole(customerAddress), "MP: Customer cannot be role account.");
-        // **那么这个测试是有效的，否则应该删除或修改。**
-        /*
-        it("客户地址为角色账户时销售应失败", async function () {
+        it("支付金额不足应该失败", async function () {
             await expect(
-                marketplace.connect(retailer).retailSaleToCustomer(tokenId, manufacturer.address)
-            ).to.be.revertedWith("MP: Customer cannot be role account.");
-        });
-        */
-
-        it("保修无效时转让应该成功 (Retailer Sale 不检查保修)", async function () {
-            const newOwner = customer1.address;
-            
-            await warrantyManagerMock.setValidStatus(false);
-            
-            await expect(
-                marketplace.connect(retailer).retailSaleToCustomer(tokenId, newOwner)
-            ).to.not.be.reverted; 
-            
-            expect(await registry.ownerOf(tokenId)).to.equal(newOwner);
-            
-            await warrantyManagerMock.setValidStatus(true); // 恢复有效状态
-        });
-
-        it("零售商应该能成功销售给客户", async function () {
-            const newOwner = customer1.address;
-            
-            await warrantyManagerMock.setValidStatus(true); 
-
-            await expect(
-                marketplace.connect(retailer).retailSaleToCustomer(tokenId, newOwner)
-            ).to.not.be.reverted;
-            
-            expect(await registry.ownerOf(tokenId)).to.equal(newOwner);
-
-            // 验证零售事件（RETAIL_SALE）
-            const verificationData = await registry.verifyProduct(tokenId);
-            const retailEvent = verificationData.ownershipHistory.find(
-                event => event.eventType === "RETAIL_SALE"
-            );
-            expect(retailEvent).to.exist;
-            expect(retailEvent.from).to.equal(retailer.address);
-            expect(retailEvent.to).to.equal(newOwner);
+                marketplace.connect(retailer).buyProduct(tokenId, { value: ethers.parseEther("0.01") })
+            ).to.be.revertedWith("MP: Insufficient funds sent.");
         });
     });
 
-    // Customer Resale (CustomerResale) 测试
-    describe("Customer Resale (CustomerResale)", function () {
+    // =============================================================
+    // 测试场景 3: 零售销售 (Retail Sale)
+    // =============================================================
+    describe("3. Retailer Sale to Customer", function () {
         let tokenId;
 
-        before(async function () {
-            // 完成完整前置链路：铸造→制造商→零售商→客户1
-            const tempTokenId = await registerAndDistribute(retailer.address);
-            await marketplace.connect(retailer).retailSaleToCustomer(tempTokenId, customer1.address);
-            tokenId = tempTokenId;
-            
-            // 确认当前所有者是 customer1
+        beforeEach(async function () {
+            // 1. 制造商注册
+            tokenId = await registerProduct(PRICE_MFG);
+            // 2. 零售商买入
+            await marketplace.connect(retailer).buyProduct(tokenId, { value: PRICE_MFG });
+        });
+
+        it("零售商上架产品 (List)", async function () {
+            // 零售商设定新价格并上架
+            await expect(
+                marketplace.connect(retailer).listProduct(tokenId, PRICE_RETAIL)
+            )
+            .to.emit(marketplace, "ProductListed")
+            .withArgs(tokenId, PRICE_RETAIL, retailer.address);
+
+            const marketInfo = await registry.getProductMarketInfo(tokenId);
+            expect(marketInfo.isListed).to.be.true;
+            expect(marketInfo.price).to.equal(PRICE_RETAIL);
+        });
+
+        it("客户应能购买零售商上架的产品", async function () {
+            // 先上架
+            await marketplace.connect(retailer).listProduct(tokenId, PRICE_RETAIL);
+
+            // 客户购买
+            await expect(
+                marketplace.connect(customer1).buyProduct(tokenId, { value: PRICE_RETAIL })
+            )
+            .to.emit(marketplace, "ProductSold")
+            .withArgs(tokenId, customer1.address, retailer.address, PRICE_RETAIL);
+
+            // 验证所有权
             expect(await registry.ownerOf(tokenId)).to.equal(customer1.address);
-        });
-
-        it("非当前所有者调用 customerResale 应该失败", async function () {
-            await expect(
-                marketplace.connect(customer2).customerResale(tokenId, customer2.address, TEST_PRICE, true)
-            ).to.be.revertedWith("MP: Only current owner can initiate resale.");
-        });
-
-        // **修正：角色账户调用客户转卖应失败的测试 (Marketplace.sol 缺失检查)**
-        // Marketplace.sol 中，customerResale 仅检查了 currentOwner == msg.sender。
-        // 它没有检查 msg.sender 是否是角色账户。为了测试通过，**要么在合约中添加检查，要么删除此测试。**
-        // 如果要添加检查，在 customerResale 开始时添加：
-        // require(!accessControl.hasAnyRole(msg.sender), "MP: Only for customers.");
-        /*
-        it("角色账户调用客户转卖应失败", async function () {
-            await expect(
-                marketplace.connect(manufacturer).customerResale(tokenId, customer2.address, TEST_PRICE, true)
-            ).to.be.revertedWith("MP: Only for customers.");
-        });
-        */
-
-        // **修正：转卖给角色账户应失败的测试 (Marketplace.sol 缺失检查)**
-        // Marketplace.sol 中，customerResale 仅检查了 currentOwner == msg.sender。
-        // 它没有检查 newCustomerAddress 是否是角色账户。
-        // 如果要添加检查，在 customerResale 开始时添加：
-        // require(!accessControl.hasAnyRole(newCustomerAddress), "MP: Only for customers.");
-        /*
-        it("转卖给角色账户应失败", async function () {
-            await expect(
-                marketplace.connect(customer1).customerResale(tokenId, retailer.address, TEST_PRICE, true)
-            ).to.be.revertedWith("MP: Only for customers.");
-        });
-        */
-
-        it("保修有效时客户应成功转售", async function () {
-            const newOwner = customer2.address;
-            await warrantyManagerMock.setValidStatus(true); 
             
-            await expect(
-                // 客户1 (当前所有者) 转卖给 客户2
-                marketplace.connect(customer1).customerResale(tokenId, newOwner, TEST_PRICE, true)
-            ).to.not.be.reverted;
-            
-            expect(await registry.ownerOf(tokenId)).to.equal(newOwner);
-
-            // 验证转卖事件（CUSTOMER_RESALE）
-            const verificationData = await registry.verifyProduct(tokenId);
-            const resaleEvent = verificationData.ownershipHistory.find(
-                event => event.eventType === "CUSTOMER_RESALE"
-            );
-            expect(resaleEvent).to.exist;
-            expect(resaleEvent.from).to.equal(customer1.address);
-            expect(resaleEvent.to).to.equal(newOwner);
-        });
-
-        it("保修失效时客户也能成功转售", async function () {
-            const newOwner = customer1.address;
-            const RESALE_PRICE = ethers.parseEther("50");
-            
-            await warrantyManagerMock.setValidStatus(false); 
-            
-            await expect(
-                // 客户2 (当前所有者) 转卖给 客户1
-                marketplace.connect(customer2).customerResale(tokenId, newOwner, RESALE_PRICE, true)
-            ).to.not.be.reverted; 
-
-            expect(await registry.ownerOf(tokenId)).to.equal(newOwner);
+            // 验证历史记录
+            const verifyData = await registry.verifyProduct(tokenId);
+            const lastLog = verifyData.ownershipHistory[verifyData.ownershipHistory.length - 1];
+            expect(lastLog.eventType).to.equal("RETAIL_SALE");
         });
     });
 
-    // Retailer Listing (listProductForSale) 功能测试
-    describe("Retailer Listing (listProductForSale)", function () {
+    // =============================================================
+    // 测试场景 4: 客户二手转卖 (Customer Resale)
+    // =============================================================
+    describe("4. Customer Resale (Secondary Market)", function () {
         let tokenId;
-        const LIST_PRICE = ethers.parseEther("999");
-        
+
         beforeEach(async function () {
-            // 铸造→制造商→零售商（完成前置流程）
-            tokenId = await registerAndDistribute(retailer.address);
-        });
-        
-        it("零售商应该能够成功上架产品", async function () {
-            await expect(
-                marketplace.connect(retailer).listProductForSale(tokenId, LIST_PRICE)
-            ).to.emit(marketplace, "ProductListed")
-             .withArgs(tokenId, LIST_PRICE, retailer.address);
-
-            // 验证市场信息更新
-            const marketData = await registry.marketInfo(tokenId);
-            expect(marketData.price).to.equal(LIST_PRICE);
-            expect(marketData.isListed).to.be.true;
+            // 完整流程：Mfg -> Retailer -> Customer1
+            tokenId = await registerProduct(PRICE_MFG);
+            await marketplace.connect(retailer).buyProduct(tokenId, { value: PRICE_MFG });
+            await marketplace.connect(retailer).listProduct(tokenId, PRICE_RETAIL);
+            await marketplace.connect(customer1).buyProduct(tokenId, { value: PRICE_RETAIL });
         });
 
-        it("非零售商尝试上架产品应失败", async function () {
+        it("客户1 应能转卖给 客户2", async function () {
+            // 1. 客户1 上架
+            await marketplace.connect(customer1).listProduct(tokenId, PRICE_RESALE);
+
+            // 2. 客户2 购买
             await expect(
-                marketplace.connect(customer1).listProductForSale(tokenId, LIST_PRICE)
-            ).to.be.revertedWith("MP: Only Retailer can list.");
+                marketplace.connect(customer2).buyProduct(tokenId, { value: PRICE_RESALE })
+            )
+            .to.emit(marketplace, "ProductSold")
+            .withArgs(tokenId, customer2.address, customer1.address, PRICE_RESALE);
+
+            // 验证所有权
+            expect(await registry.ownerOf(tokenId)).to.equal(customer2.address);
+
+            // 验证历史记录 (SECONDARY_SALE)
+            const verifyData = await registry.verifyProduct(tokenId);
+            const lastLog = verifyData.ownershipHistory[verifyData.ownershipHistory.length - 1];
+            expect(lastLog.eventType).to.equal("SECONDARY_SALE");
         });
 
-        it("零售商未拥有产品时上架应失败", async function () {
-            // 零售商将产品卖给客户后，不再拥有所有权
-            await marketplace.connect(retailer).retailSaleToCustomer(tokenId, customer1.address);
-            
+        it("非拥有者不能上架", async function () {
             await expect(
-                marketplace.connect(retailer).listProductForSale(tokenId, LIST_PRICE)
-            ).to.be.reverted;
+                marketplace.connect(customer2).listProduct(tokenId, PRICE_RESALE)
+            ).to.be.revertedWith("MP: Not owner.");
         });
     });
 });
